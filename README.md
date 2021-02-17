@@ -34,6 +34,14 @@
 
 *balloons over the ruins of a city*
 
+<img src="./samples/the_death_of_the_lonesome_astronomer.png" width="250px"></img>
+
+*the death of the lonesome astronomer* - by <a href="https://github.com/moirage">moirage</a>
+
+<img src="./samples/the_tragic_intimacy_of_the_eternal_conversation_with_oneself.png" width="250px"></img>
+
+*the tragic intimacy of the eternal conversation with oneself* - by <a href="https://github.com/moirage">moirage</a>
+
 ## Big Sleep
 
 <a href="https://twitter.com/advadnoun">Ryan Murdock</a> has done it again, combining OpenAI's <a href="https://github.com/openai/CLIP">CLIP</a> and the generator from a <a href="https://arxiv.org/abs/1809.11096">BigGAN</a>! This repository wraps up his work so it is easily accessible to anyone who owns a GPU.
@@ -60,7 +68,7 @@ $ pip install big-sleep
 $ dream "a pyramid made of ice"
 ```
 
-Images will be saved to whereever the command is invoked
+Images will be saved to wherever the command is invoked
 
 ## Advanced
 
@@ -97,6 +105,12 @@ To save the progression of images during training, you simply have to supply the
 $ dream "a bowl of apples next to the fireplace" --save-progress --save-every 100
 ```
 
+Due to the class conditioned nature of the GAN, Big Sleep often steers off the manifold into noise. You can use a flag to save the best high scoring image (per CLIP critic) to `{filepath}.best.png` in your folder.
+
+```bash
+$ dream "a room with a view of the ocean" --save-best
+```
+
 ## Experimentation
 
 You can set the number of classes that you wish to restrict Big Sleep to use for the Big GAN with the `--max-classes` flag as follows (ex. 15 classes). This may lead to extra stability during training, at the cost of lost expressivity.
@@ -108,6 +122,10 @@ $ dream 'a single flower in a withered field' --max-classes 15
 ## Alternatives
 
 <a href="https://github.com/lucidrains/deep-daze">Deep Daze</a> - CLIP and a deep SIREN network
+
+## Used By
+
+- <a href="https://dank.xyz/">Dank.xyz</a>
 
 ## Citations
 

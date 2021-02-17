@@ -12,13 +12,15 @@ import subprocess
 import signal
 from datetime import datetime
 from pathlib import Path
-from tqdm import trange
+from tqdm import tqdm, trange
 from collections import namedtuple
 
 from big_sleep.biggan import BigGAN
 from big_sleep.clip import load, tokenize, normalize_image
 
 from einops import rearrange
+
+from .resample import resample
 
 assert torch.cuda.is_available(), 'CUDA must be available in order to use Deep Daze'
 
@@ -87,16 +89,18 @@ perceptor, preprocess = load()
 class Latents(torch.nn.Module):
     def __init__(
         self,
-        num_latents = 32,
+        num_latents = 15,
+        num_classes = 1000,
+        z_dim = 128,
         max_classes = None,
         class_temperature = 2.
     ):
         super().__init__()
-        self.normu = torch.nn.Parameter(torch.zeros(num_latents, 128).normal_(std = 1))
-        self.cls = torch.nn.Parameter(torch.zeros(num_latents, 1000).normal_(mean = -3.9, std = .3))
+        self.normu = torch.nn.Parameter(torch.zeros(num_latents, z_dim).normal_(std = 1))
+        self.cls = torch.nn.Parameter(torch.zeros(num_latents, num_classes).normal_(mean = -3.9, std = .3))
         self.register_buffer('thresh_lat', torch.tensor(1))
 
-        assert not exists(max_classes) or max_classes > 0 and max_classes <= 1000, 'num classes must be between 0 and 1000'
+        assert not exists(max_classes) or max_classes > 0 and max_classes <= num_classes, f'max_classes must be between 0 and {num_classes}'
         self.max_classes = max_classes
         self.class_temperature = class_temperature
 
@@ -125,6 +129,9 @@ class Model(nn.Module):
 
     def init_latents(self):
         self.latents = Latents(
+            num_latents = len(self.biggan.config.layers) + 1,
+            num_classes = self.biggan.config.num_classes,
+            z_dim = self.biggan.config.z_dim,
             max_classes = self.max_classes,
             class_temperature = self.class_temperature
         )
@@ -144,12 +151,14 @@ class BigSleep(nn.Module):
         image_size = 512,
         bilinear = False,
         max_classes = None,
-        class_temperature = 2.
+        class_temperature = 2.,
+        experimental_resample = False,
     ):
         super().__init__()
         self.loss_coef = loss_coef
         self.image_size = image_size
         self.num_cutouts = num_cutouts
+        self.experimental_resample = experimental_resample
 
         self.interpolation_settings = {'mode': 'bilinear', 'align_corners': False} if bilinear else {'mode': 'nearest'}
 
@@ -162,7 +171,7 @@ class BigSleep(nn.Module):
     def reset(self):
         self.model.init_latents()
 
-    def forward(self, text, return_loss = True):
+    def forward(self, text_embed, return_loss = True):
         width, num_cutouts = self.image_size, self.num_cutouts
 
         out = self.model()
@@ -176,21 +185,23 @@ class BigSleep(nn.Module):
             offsetx = torch.randint(0, width - size, ())
             offsety = torch.randint(0, width - size, ())
             apper = out[:, :, offsetx:offsetx + size, offsety:offsety + size]
-            apper = F.interpolate(apper, (224, 224), **self.interpolation_settings)
+            if (self.experimental_resample):
+                apper = resample(apper, (224, 224))
+            else:
+                apper = F.interpolate(apper, (224, 224), **self.interpolation_settings)
             pieces.append(apper)
 
         into = torch.cat(pieces)
         into = normalize_image(into)
 
         image_embed = perceptor.encode_image(into)
-        text_embed = perceptor.encode_text(text)
 
         latents, soft_one_hot_classes = self.model.latents()
         num_latents = latents.shape[0]
         latent_thres = self.model.latents.thresh_lat
 
         lat_loss =  torch.abs(1 - torch.std(latents, dim=1)).mean() + \
-                    torch.abs(torch.mean(latents)).mean() + \
+                    torch.abs(torch.mean(latents, dim = 1)).mean() + \
                     4 * torch.max(torch.square(latents).mean(), latent_thres)
 
         for array in latents:
@@ -202,7 +213,8 @@ class BigSleep(nn.Module):
             skews = torch.mean(torch.pow(zscores, 3.0))
             kurtoses = torch.mean(torch.pow(zscores, 4.0)) - 3.0
 
-        lat_loss = lat_loss + torch.abs(kurtoses) / num_latents + torch.abs(skews) / num_latents
+            lat_loss = lat_loss + torch.abs(kurtoses) / num_latents + torch.abs(skews) / num_latents
+
         cls_loss = ((50 * torch.topk(soft_one_hot_classes, largest = False, dim = 1, k = 999)[0]) ** 2).mean()
 
         sim_loss = -self.loss_coef * torch.cosine_similarity(text_embed, image_embed, dim = -1).mean()
@@ -226,9 +238,15 @@ class Imagine(nn.Module):
         torch_deterministic = False,
         max_classes = None,
         class_temperature = 2.,
-        save_date_time = False
+        save_date_time = False,
+        save_best = False,
+        experimental_resample = False,
     ):
         super().__init__()
+
+        if torch_deterministic:
+            assert not bilinear, 'the deterministic (seeded) operation does not work with interpolation (PyTorch 1.7.1)'
+            torch.set_deterministic(True)
 
         if exists(seed):
             print(f'setting seed of {seed}')
@@ -236,9 +254,6 @@ class Imagine(nn.Module):
                 print('you can override this with --seed argument in the command line, or --random for a randomly chosen one')
             torch.manual_seed(seed)
 
-        if torch_deterministic:
-            assert not bilinear, 'the deterministic (seeded) operation does not work with interpolation (PyTorch 1.7.1)'
-            torch.set_deterministic(True)
 
         self.epochs = epochs
         self.iterations = iterations
@@ -247,7 +262,8 @@ class Imagine(nn.Module):
             image_size = image_size,
             bilinear = bilinear,
             max_classes = max_classes,
-            class_temperature = class_temperature
+            class_temperature = class_temperature,
+            experimental_resample = experimental_resample,
         ).cuda()
 
         self.model = model
@@ -259,25 +275,32 @@ class Imagine(nn.Module):
 
         self.save_progress = save_progress
         self.save_date_time = save_date_time
+
+        self.save_best = save_best
+        self.current_best_score = 0
+
         self.open_folder = open_folder
+        self.total_image_updates = (self.epochs * self.iterations) / self.save_every
 
         self.set_text(text)
 
     def set_text(self, text):
         self.text = text
-        textpath = self.text.replace(' ','_')
+        textpath = self.text.replace(' ','_')[:255]
         if self.save_date_time:
             textpath = datetime.now().strftime("%y%m%d-%H%M%S-") + textpath
 
         self.textpath = textpath
         self.filename = Path(f'./{textpath}.png')
-        self.encoded_text = tokenize(text).cuda()
+        encoded_text = tokenize(text).cuda()
+        self.encoded_text = perceptor.encode_text(encoded_text).detach()
 
     def reset(self):
         self.model.reset()
+        self.model = self.model.cuda()
         self.optimizer = Adam(self.model.model.latents.parameters(), self.lr)
 
-    def train_step(self, epoch, i):
+    def train_step(self, epoch, i, pbar=None):
         total_loss = 0
 
         for _ in range(self.gradient_accumulate_every):
@@ -291,30 +314,43 @@ class Imagine(nn.Module):
 
         if (i + 1) % self.save_every == 0:
             with torch.no_grad():
-                best = torch.topk(losses[2], k = 1, largest = False)[1]
+                top_score, best = torch.topk(losses[2], k = 1, largest = False)
                 image = self.model.model()[best].cpu()
+
                 save_image(image, str(self.filename))
-                print(f'image updated at "./{str(self.filename)}"')
+                if pbar is not None:
+                    pbar.update(1)
+                else:
+                    print(f'image updated at "./{str(self.filename)}"')
+                    
 
                 if self.save_progress:
                     total_iterations = epoch * self.iterations + i
                     num = total_iterations // self.save_every
                     save_image(image, Path(f'./{self.textpath}.{num}.png'))
 
+                if self.save_best and top_score.item() < self.current_best_score:
+                    self.current_best_score = top_score.item()
+                    save_image(image, Path(f'./{self.textpath}.best.png'))
+
         return total_loss
 
     def forward(self):
         print(f'Imagining "{self.text}" from the depths of my weights...')
 
+        self.model(self.encoded_text) # one warmup step due to issue with CLIP and CUDA
+
         if self.open_folder:
             open_folder('./')
             self.open_folder = False
 
-        for epoch in trange(self.epochs, desc = 'epochs'):
-            pbar = trange(self.iterations, desc='iteration')
+        image_pbar = tqdm(total=self.total_image_updates, desc='image update', position=2, leave=True)
+        for epoch in trange(self.epochs, desc = '      epochs', position=0, leave=True):
+            pbar = trange(self.iterations, desc='   iteration', position=1, leave=True)
+            image_pbar.update(0)
             for i in pbar:
-                loss = self.train_step(epoch, i)
-                pbar.set_description(f'loss: {loss.item():.2f}')
+                loss = self.train_step(epoch, i, image_pbar)
+                pbar.set_description(f'loss: {loss.item():04.2f}')
 
                 if terminate:
                     print('detecting keyboard interrupt, gracefully exiting')
